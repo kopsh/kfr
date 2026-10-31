@@ -1,0 +1,1 @@
+. "/home/user/kfr/tools/kfr-6.3.1-clang/conan/conanbuildenv-release-armv8.sh"

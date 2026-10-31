@@ -74,3 +74,29 @@ check              newest GLIBCXX=3.4.21   CXXABI=1.3      OK
   ```
 
 - 静态库（`.a`）没有符号版本信息。要用 GCC 10 链接一个测试程序，再检查生成的可执行文件，脚本里的 `app_static` 就是这么做的。
+
+## Conan
+
+问题：Conan 把 `compiler` 和 `compiler.version` 算进 `package_id`。业务方的 profile 是 `gcc 10`，而包是用 Clang 编的，所以会报 `ERROR: Missing binary`。
+
+`conan/` 目录里有一个验证过的 recipe 模板和两个 profile（Conan 2）：
+
+- **方案一（推荐）**：在 recipe 里加 `compatibility()`，声明 `gcc >= 10` 的使用方可以用 Clang 编的二进制。包的元数据保持真实（仍记录为 Clang 编译）。
+  - 注意：在 `compatibility()` 里改 `compiler` 时，`compiler.libcxx` 和 `compiler.cppstd` 会被重置为空，必须显式带上，否则候选的 package_id 匹配不上。
+  - `clang_versions` 要包含你们实际用来构建的 Clang 版本。
+- **方案二**：不改 recipe，构建包时 profile 的 `settings` 写 `gcc 10`，再用 `tools.build:compiler_executables` 把实际使用的编译器换成 Clang。
+  - 优点：业务方直接匹配上，不需要任何兼容规则。
+  - 缺点：包的元数据和实际使用的编译器不一致。
+
+```bash
+# 构建包：KFR_ROOT 指向 build-clang.sh 的安装目录
+KFR_ROOT=/path/to/install conan create conan -pr:h conan/profiles/clang-gcc10rt
+# 业务方
+conan install --requires myfft/1.0 -pr:h conan/profiles/gcc10
+#   -> myfft/1.0: Found compatible package '...': compiler=clang, compiler.version=...
+```
+
+验证结果（Conan 2.34，clang 18 + GCC 10.5，aarch64）：
+- 没有 `compatibility()` 时报 `Missing binary`。
+- 加上之后，GCC 10 的使用方通过 `CMakeDeps` 找到包，编译、链接、运行都通过。最终程序依赖的符号版本最高到 `GLIBCXX_3.4.21`。
+- 方案二同样验证通过。

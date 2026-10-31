@@ -1,0 +1,17 @@
+# Builds the package with Clang against the GCC 10.3.1 runtime (native ARM64 build).
+# Adjust the Clang version and the GCC 10.3.1 prefix. If the prefix holds several GCC versions,
+# use --gcc-install-dir=<prefix>/lib/gcc/aarch64-linux-gnu/10.3.1 instead (clang >= 16).
+[settings]
+os=Linux
+arch=armv8
+compiler=clang
+compiler.version=15
+compiler.libcxx=libstdc++11
+compiler.cppstd=17
+build_type=Release
+[conf]
+tools.build:compiler_executables={"c": "clang", "cpp": "clang++"}
+tools.build:cflags=["--gcc-toolchain=/opt/gcc-10.3.1"]
+tools.build:cxxflags=["--gcc-toolchain=/opt/gcc-10.3.1"]
+tools.build:sharedlinkflags=["--gcc-toolchain=/opt/gcc-10.3.1"]
+tools.build:exelinkflags=["--gcc-toolchain=/opt/gcc-10.3.1"]
