@@ -76,13 +76,11 @@ aarch64（Clang + neon64，qemu）：2M 点精度和 x86 一致；200M 点四步
 | 文件 | 说明 |
 |---|---|
 | `probe.cpp` | 打印 plan.data、temp_size 和各 stage（`DUMP=1`），测峰值 RSS |
-| `fourstep.hpp` | 四步法实现 |
-| `fstest.cpp` | 精度测试（`accuracy`），以及直接计算和四步法的内存、耗时对比（`direct` / `fourstep`，可选 `f64`） |
+| `fourstep.hpp` | 四步法实现：`execute_destroy`（覆盖输入）、`execute`（保留输入）、`execute_inplace`（原地） |
+| `bench.cpp` | 精度检查（`check`），以及 KFR 直接计算和四步法各模式的内存、耗时对比 |
+| `run_bench.sh` | 在目标机器上编译 `bench.cpp` 并跑完整对比 |
 
 ```bash
 # aarch64，KFR 由 ../kfr-6.3.1-clang/build-clang.sh 安装到 $KFR
-clang++ -std=c++17 -O3 -DNDEBUG -I$KFR/include fstest.cpp -L$KFR/lib -lkfr_dft_neon64 -o fstest
-./fstest 2000000 accuracy
-./fstest 200000000 direct
-./fstest 200000000 fourstep
+./run_bench.sh --kfr $KFR --cxx clang++ --n 200000000
 ```
