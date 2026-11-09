@@ -37,6 +37,55 @@ static double peak_gib()
     getrusage(RUSAGE_SELF, &r);
     return r.ru_maxrss / 1048576.0;
 }
+// ---------------------------------------------------------------- memory guard
+// Every test states how much memory it needs; if MemAvailable (Linux) is not enough the test is skipped, so
+// that running the whole script on a shared machine cannot trigger the OOM killer.
+static double mem_available_bytes()
+{
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f)
+        return -1;
+    char line[256];
+    double kb = -1;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "MemAvailable: %lf kB", &kb) == 1)
+            break;
+    fclose(f);
+    return kb < 0 ? -1 : kb * 1024;
+}
+static bool fits(const std::string& what, double need)
+{
+    const double avail = mem_available_bytes();
+    if (avail < 0 || need <= 0.75 * avail)
+        return true;
+    printf("skipped %s: needs about %.1f GiB, MemAvailable is %.1f GiB\n", what.c_str(), need / 1073741824.0,
+           avail / 1073741824.0);
+    return false;
+}
+static std::string base_mode(std::string m)
+{
+    if (auto at = m.find('@'); at != std::string::npos)
+        m.resize(at);
+    return m;
+}
+static bool is_real_mode(const std::string& m) { return m == "rdirect" || m == "rfs" || m == "rfs_inplace"; }
+static bool needs_out(const std::string& m)
+{
+    return m == "direct" || m == "fs" || m == "fs_auto" || m == "fs_copy_inplace" || m == "rdirect" || m == "rfs";
+}
+// bytes of the data set: n complex numbers, or n reals for the real modes
+static double data_bytes(const std::string& m, size_t n, size_t esz) { return double(n) * (is_real_mode(m) ? esz : 2 * esz); }
+// extra memory of the transform itself (KFR dft_plan: twiddles + scratch, about 2 data sets; dft_plan_real about 2.5)
+static double plan_extra_bytes(const std::string& m, size_t n, size_t esz)
+{
+    const double d = data_bytes(m, n, esz);
+    if (m == "direct" || m == "direct_inplace")
+        return 2 * d;
+    if (m == "rdirect")
+        return 2.5 * d;
+    return 0.02 * d + (64 << 20); // four-step: tables + workspaces
+}
+
 template <typename T>
 static void fill(complex<T>* a, size_t n)
 {
@@ -205,16 +254,26 @@ static runner<T> make_runner(size_t n, std::string mode)
 }
 
 template <typename T>
-static int ab(size_t n, const std::string& ma, const std::string& mb, int reps)
+static int ab(size_t n, const std::string& ma_, const std::string& mb_, int reps)
 {
-    univector<complex<T>> src(n), in(n), out(n);
-    fill(src.data(), n);
-    std::memset((void*)out.data(), 0, n * sizeof(complex<T>));
+    const std::string ma = base_mode(ma_), mb = base_mode(mb_);
+    const bool re        = is_real_mode(ma);
+    // complex<T> elements of one data set: n complex numbers, or n + 2 reals for the real modes
+    const size_t e_in  = re ? n / 2 + 1 : n;
+    const size_t e_out = (needs_out(ma) || needs_out(mb)) ? e_in : 0;
+    const double need  = 2.0 * e_in * sizeof(complex<T>) + e_out * sizeof(complex<T>) + plan_extra_bytes(ma, n, sizeof(T)) +
+                         plan_extra_bytes(mb, n, sizeof(T));
+    if (!fits("ab " + ma_ + " vs " + mb_, need))
+        return 0;
+    univector<complex<T>> src(e_in), in(e_in), out(e_out);
+    fill(src.data(), e_in);
+    if (e_out)
+        std::memset((void*)out.data(), 0, e_out * sizeof(complex<T>));
     runner<T> A = make_runner<T>(n, ma), B = make_runner<T>(n, mb);
     std::vector<double> ta, tb, ratio;
     auto timed = [&](runner<T>& r)
     {
-        std::memcpy((void*)in.data(), src.data(), n * sizeof(complex<T>));
+        std::memcpy((void*)in.data(), src.data(), e_in * sizeof(complex<T>));
         const double t0 = now();
         r.run(in.data(), out.data());
         return now() - t0;
@@ -496,6 +555,20 @@ static int check(size_t n)
         }
     }
     {
+        // default options, multi-threaded execute(): power-of-two N1 runs as parallel copy + parallel in-place
+        fft_fourstep<T> f(n);
+        auto par = fft_fourstep<T>::thread_executor(3);
+        auto wss = f.make_workspaces(3);
+        auto w1  = f.make_workspace();
+        univector<complex<T>> serial(n), parallel(n);
+        f.execute(serial.data(), a0.data(), false, w1);
+        f.execute(parallel.data(), a0.data(), false, wss, par);
+        const bool same = std::memcmp((const void*)serial.data(), (const void*)parallel.data(), n * sizeof(complex<T>)) == 0;
+        printf("  %-15s %s (route: %s)\n", "mt execute dflt", same ? "OK (bit-identical)" : "FAIL",
+               f.oop_via_inplace() ? "copy + in-place" : "direct");
+        fails += !same;
+    }
+    {
         fft_fourstep<T> f(n); // default options
         a = a0;
         f.execute_inplace(a.data());
@@ -547,6 +620,12 @@ int main(int argc, char** argv)
     std::string mode = argv[3];
     if (mode == "tune") // bench N f32|f64 tune [inplace|oop] [real]
     {
+        {
+            const bool ip_ = argc < 5 || strcmp(argv[4], "oop") != 0;
+            const double data = double(n) * (f64 ? 8 : 4) * (argc > 5 && strcmp(argv[5], "real") == 0 ? 1 : 2);
+            if (!fits("tune", (ip_ ? 1 : 2) * data + (64 << 20)))
+                return 0;
+        }
         const bool ip = argc < 5 || strcmp(argv[4], "oop") != 0;
         const bool re = argc > 5 && strcmp(argv[5], "real") == 0;
         auto run = [&](auto tag)
@@ -567,6 +646,12 @@ int main(int argc, char** argv)
     if (mode == "check")
         return (f64 ? check<double>(n) : check<float>(n)) + (n % 2 == 0 && fft_fourstep_real<float>::find_split(n) ? (f64 ? check_real<double>(n) : check_real<float>(n)) : 0);
     if (mode == "rdirect" || mode == "rfs" || mode == "rfs_inplace")
+    {
+        const double d = double(n) * (f64 ? 8 : 4);
+        if (!fits(mode, (mode == "rdirect" ? 4.5 : mode == "rfs" ? 2.0 : 1.0) * d + (64 << 20)))
+            return 0;
+    }
+    if (mode == "rdirect" || mode == "rfs" || mode == "rfs_inplace")
         return f64 ? timing_real<double>(n, mode, argc > 4 ? std::max(1, atoi(argv[4])) : 3)
                    : timing_real<float>(n, mode, argc > 4 ? std::max(1, atoi(argv[4])) : 3);
     if (mode == "ab")
@@ -580,5 +665,11 @@ int main(int argc, char** argv)
         return f64 ? ab<double>(n, argv[4], argv[5], r) : ab<float>(n, argv[4], argv[5], r);
     }
     const int reps = argc > 4 ? std::max(1, atoi(argv[4])) : 3;
+    {
+        const double d = double(n) * (f64 ? 16 : 8);
+        const double k = mode == "direct" ? 4 : mode == "direct_inplace" ? 3 : mode == "fs_inplace" ? 1 : 2;
+        if (!fits(mode, k * d + (64 << 20)))
+            return 0;
+    }
     return f64 ? timing<double>(n, mode, reps) : timing<float>(n, mode, reps);
 }

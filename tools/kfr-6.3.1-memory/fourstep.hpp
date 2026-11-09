@@ -140,7 +140,9 @@ public:
         return choose_n1(n, o);
     }
 
-    /// Per-call scratch memory (a few MB). One per thread for concurrent calls.
+    /// Per-call scratch memory, one per thread for concurrent calls. In-place execution needs
+    /// B * N1 complex numbers plus the temp of the sub-plans (about 1 MB); the direct out-of-place path grows
+    /// the buffer to B * max(N1, N2) complex numbers on first use.
     struct workspace
     {
         kfr::univector<kfr::u8> temp;
@@ -151,7 +153,7 @@ public:
     {
         workspace w;
         w.temp.resize(std::max(p1.temp_size, p2.temp_size));
-        w.buf.resize(B * std::max(N1, N2));
+        w.buf.resize(B * N1);
         return w;
     }
 
@@ -225,11 +227,16 @@ public:
     size_t n2() const { return N2; }
     /// True if execute_inplace() needs no N-point buffer for this plan.
     bool inplace_without_work() const { return N2 % N1 == 0 || N1 % N2 == 0; }
-    /// Memory owned by the plan (twiddles, sub-plans) plus one workspace.
-    size_t extra_bytes() const
+    /// Memory owned by the plan (twiddles, sub-plans), not counting workspaces.
+    size_t plan_bytes() const
     {
-        return p1.data_size + p2.data_size + (lo.size() + hi.size() + wj.size()) * sizeof(T) +
-               std::max(p1.temp_size, p2.temp_size) + B * std::max(N1, N2) * sizeof(C);
+        return p1.data_size + p2.data_size + (lo.size() + hi.size() + wj.size()) * sizeof(T);
+    }
+    /// Bytes of one workspace for in-place execution (also copy + in-place) and for the direct out-of-place path.
+    size_t workspace_bytes_inplace() const { return std::max(p1.temp_size, p2.temp_size) + B * N1 * sizeof(C); }
+    size_t workspace_bytes_oop() const
+    {
+        return std::max(p1.temp_size, p2.temp_size) + B * std::max(N1, N2) * sizeof(C);
     }
 
     /// True if execute() runs as copy + in-place transform. Measured: with a power-of-two N1 the strided
@@ -456,7 +463,9 @@ private:
         for_each((N1 + B - 1) / B, par,
                  [&](size_t blk, size_t w)
                  {
-                     workspace& ws   = wss[w];
+                     workspace& ws = wss[w];
+                     if (ws.buf.size() < B * N2)
+                         ws.buf.resize(B * N2); // grown once per workspace; step 1 of this call is complete
                      T* b            = reinterpret_cast<T*>(ws.buf.data());
                      const size_t r0 = blk * B, nb = std::min(B, N1 - r0);
                      for (size_t n2 = 0; n2 < N2; ++n2)

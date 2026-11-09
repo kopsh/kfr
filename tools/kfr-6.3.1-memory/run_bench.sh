@@ -7,6 +7,9 @@
 #                  [--types "f32 f64"] [--threads 4] [--flags "..."] [--quick]
 #
 # Output goes to stdout and to $OUT/report.txt (default ./kfr-memory-bench). Send that file back.
+# Tests that need more than 75% of MemAvailable are skipped (printed as 'skipped ...'), never run.
+# Expect about an hour at N=200M with both types on 4 cores; --quick is about 15 minutes, --types f32 halves
+# both time and memory.
 set -uo pipefail
 
 KFR=""
