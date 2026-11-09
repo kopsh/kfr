@@ -2,7 +2,8 @@
 //
 //   bench N f32|f64 MODE [reps]          time and peak RSS (input regenerated before every run, not timed)
 //   bench N f32|f64 check                accuracy of all modes vs f64 dft_plan, plus inverse
-// MODE: direct | direct_inplace | fs_destroy | fs_preserve | fs_inplace
+// MODE: direct | direct_inplace | fs (out-of-place, input preserved) | fs_inplace (no work buffer)
+//       | fs_inplace_work (in-place using an N-point work buffer)
 // env:  CPU=sse2|sse41|avx|avx2 (x86 only, override KFR's runtime dispatch), FS_N1, FS_B, FS_PF (options)
 #include "fourstep.hpp"
 #ifdef __x86_64__
@@ -74,7 +75,9 @@ static int timing(size_t n, const std::string& mode, int reps)
     else
     {
         double t0 = now();
-        fft_fourstep<T> f(n, fs_opts<T>());
+        auto opt    = fs_opts<T>();
+        opt.inplace = mode == "fs_inplace";
+        fft_fourstep<T> f(n, opt);
         tplan = now() - t0;
         char s[96];
         snprintf(s, sizeof(s), " N1=%zu N2=%zu", f.n1(), f.n2());
@@ -83,17 +86,17 @@ static int timing(size_t n, const std::string& mode, int reps)
         {
             restore();
             double a = now();
-            if (mode == "fs_destroy")
-                f.execute_destroy(out.data(), in.data());
-            else if (mode == "fs_preserve")
+            if (mode == "fs")
                 f.execute(out.data(), in.data());
             else
                 f.execute_inplace(in.data());
             ts.push_back(now() - a);
         }
 #if FS_PROFILE
-        printf("  profile (all runs): gather=%.2f fft1=%.2f twiddle+scatter=%.2f fft2=%.2f transpose=%.2f\n",
-               f.prof[0], f.prof[1], f.prof[2], f.prof[3], f.prof[4]);
+        printf("  profile per run: s1.gather=%.2f s1.fft=%.2f s1.twiddle+store=%.2f | s2.gather=%.2f s2.fft=%.2f "
+               "s2.scatter=%.2f | inplace: chunk=%.2f square=%.2f\n",
+               f.prof[0] / reps, f.prof[8] / reps, f.prof[1] / reps, f.prof[2] / reps, f.prof[3] / reps,
+               f.prof[4] / reps, f.prof[6] / reps, f.prof[7] / reps);
 #endif
     }
     std::sort(ts.begin(), ts.end());
@@ -138,25 +141,45 @@ static int check(size_t n)
         p.execute(o.data(), a0.data(), t.data());
         report("direct", err(o.data()));
     }
-    fft_fourstep<T> f(n, fs_opts<T>());
-    printf("  N1=%zu N2=%zu\n", f.n1(), f.n2());
-    a = a0;
-    f.execute_destroy(o.data(), a.data());
-    report("fs_destroy", err(o.data()));
-    f.execute(o.data(), a0.data());
-    report("fs_preserve", err(o.data()));
-    a = a0;
-    f.execute_inplace(a.data());
-    report("fs_inplace", err(a.data()));
-    // inverse: back = idft(dft(x)) / n
-    f.execute_inplace(a.data(), true);
-    double e = 0, s = 0;
-    for (size_t i = 0; i < n; i++)
     {
-        s += std::norm(complex<double>(a0[i]));
-        e += std::norm(complex<double>(a[i]) / double(n) - complex<double>(a0[i]));
+        fft_fourstep<T> f(n, fs_opts<T>());
+        printf("  N1=%zu N2=%zu\n", f.n1(), f.n2());
+        a = a0;
+        f.execute(o.data(), a.data());
+        report("fs", err(o.data()));
+        bool same = std::memcmp((const void*)a.data(), (const void*)a0.data(), n * sizeof(complex<T>)) == 0;
+        printf("  %-15s %s\n", "fs input kept", same ? "OK" : "FAIL");
+        fails += !same;
+        // inverse: back = idft(dft(x)) / n, computed out-of-place
+        univector<complex<T>> back(n);
+        f.execute(back.data(), o.data(), true);
+        double e = 0, s = 0;
+        for (size_t i = 0; i < n; i++)
+        {
+            s += std::norm(complex<double>(a0[i]));
+            e += std::norm(complex<double>(back[i]) / double(n) - complex<double>(a0[i]));
+        }
+        report("fs_roundtrip", std::sqrt(e / s));
     }
-    report("fs_roundtrip", std::sqrt(e / s));
+    for (int restricted = 1; restricted >= 0; --restricted)
+    {
+        auto opt    = fs_opts<T>();
+        opt.inplace = restricted;
+        fft_fourstep<T> f(n, opt);
+        printf("  inplace plan N1=%zu N2=%zu (%s)\n", f.n1(), f.n2(),
+               f.inplace_without_work() ? "no work buffer" : "work buffer");
+        a = a0;
+        f.execute_inplace(a.data());
+        report(restricted ? "fs_inplace" : "fs_inplace_work", err(a.data()));
+        f.execute_inplace(a.data(), true);
+        double e = 0, s = 0;
+        for (size_t i = 0; i < n; i++)
+        {
+            s += std::norm(complex<double>(a0[i]));
+            e += std::norm(complex<double>(a[i]) / double(n) - complex<double>(a0[i]));
+        }
+        report("inplace_roundtrip", std::sqrt(e / s));
+    }
     return fails;
 }
 

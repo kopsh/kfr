@@ -42,7 +42,7 @@ done
 echo "== memory / speed, N=$N, $REPS runs each (input regenerated before each run, not timed)"
 free -g 2>/dev/null | head -2 || true
 for t in $TYPES; do
-    for m in direct direct_inplace fs_destroy fs_preserve fs_inplace; do
+    for m in direct direct_inplace fs fs_inplace; do
         "$OUT/bench" "$N" $t $m "$REPS" || echo "$m $t failed (out of memory?)"
     done
 done | tee "$OUT/matrix.txt"
