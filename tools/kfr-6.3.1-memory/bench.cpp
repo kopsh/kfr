@@ -4,6 +4,7 @@
 //   bench N f32|f64 check                accuracy of all modes vs f64 dft_plan, plus inverse, plus a 2-thread test
 //   bench N f32|f64 ab A B [reps]        interleaved A/B timing in one process (A,B in turn, order alternates);
 //                                        prints both medians and the median/min/max of the per-pair ratio B/A
+// MODE: (append @N to a fs / fs_auto / fs_inplace mode in `ab` to run it with N threads)
 // MODE: direct | direct_inplace | fs (out-of-place, input preserved) | fs_inplace (no work buffer)
 //       | fs_inplace_work (in-place using an N-point work buffer) | fs_copy_inplace (memcpy + fs_inplace, input kept)
 //       | fs_auto (execute() with default options: picks direct or copy + in-place)
@@ -98,12 +99,6 @@ static int timing(size_t n, const std::string& mode, int reps)
                 f.execute_inplace(in.data());
             ts.push_back(now() - a);
         }
-#if FS_PROFILE
-        printf("  profile per run: s1.gather=%.2f s1.fft=%.2f s1.twiddle+store=%.2f | s2.gather=%.2f s2.fft=%.2f "
-               "s2.scatter=%.2f | inplace: chunk=%.2f square=%.2f\n",
-               f.prof[0] / reps, f.prof[8] / reps, f.prof[1] / reps, f.prof[2] / reps, f.prof[3] / reps,
-               f.prof[4] / reps, f.prof[6] / reps, f.prof[7] / reps);
-#endif
     }
     std::sort(ts.begin(), ts.end());
     printf("%-15s %s n=%zu plan=%.2fs exec min=%.3fs median=%.3fs peak_rss=%.3fGiB%s\n", mode.c_str(),
@@ -120,9 +115,15 @@ struct runner
 };
 
 template <typename T>
-static runner<T> make_runner(size_t n, const std::string& mode)
+static runner<T> make_runner(size_t n, std::string mode)
 {
     runner<T> r;
+    size_t threads = 1; // "fs_inplace@4": run the four-step modes with 4 threads
+    if (auto at = mode.find('@'); at != std::string::npos)
+    {
+        threads = std::max(1, atoi(mode.c_str() + at + 1));
+        mode.resize(at);
+    }
     if (mode == "direct" || mode == "direct_inplace")
     {
         auto p  = std::make_shared<dft_plan<T>>(n);
@@ -138,8 +139,20 @@ static runner<T> make_runner(size_t n, const std::string& mode)
     auto f             = std::make_shared<fft_fourstep<T>>(n, opt);
     auto ws            = std::make_shared<typename fft_fourstep<T>::workspace>(f->make_workspace());
     char s[96];
-    snprintf(s, sizeof(s), "N1=%zu N2=%zu", f->n1(), f->n2());
+    snprintf(s, sizeof(s), "N1=%zu N2=%zu threads=%zu", f->n1(), f->n2(), threads);
     r.info = s;
+    if (threads > 1)
+    {
+        auto wss = std::make_shared<std::vector<typename fft_fourstep<T>::workspace>>(f->make_workspaces(threads));
+        auto par = std::make_shared<typename fft_fourstep<T>::parallel_for_t>(fft_fourstep<T>::thread_executor(threads));
+        if (mode == "fs" || mode == "fs_auto")
+            r.run = [=](complex<T>* in, complex<T>* out) { f->execute(out, in, false, *wss, *par); };
+        else if (mode == "fs_inplace")
+            r.run = [=](complex<T>* in, complex<T>*) { f->execute_inplace(in, false, *wss, *par); };
+        else
+            throw std::invalid_argument("mode " + mode + " has no multi-threaded variant");
+        return r;
+    }
     if (mode == "fs" || mode == "fs_auto")
         r.run = [=](complex<T>* in, complex<T>* out) { f->execute(out, in, false, *ws); };
     else if (mode == "fs_inplace")
@@ -266,6 +279,36 @@ static int check(size_t n)
         report("2 threads", err(o1.data()));
         printf("  %-15s %s\n", "2 threads equal", same ? "OK" : "FAIL");
         fails += !same;
+    }
+    for (int ip = 0; ip < 2; ++ip)
+    {
+        // opt-in multi-threading: results must be bit-identical to the serial ones
+        auto opt = fs_opts<T>();
+        opt.oop_strategy = ip ? 1 : 0;
+        fft_fourstep<T> f(n, ip ? fft_fourstep<T>::for_inplace() : opt);
+        auto par = fft_fourstep<T>::thread_executor(3);
+        auto wss = f.make_workspaces(3);
+        univector<complex<T>> serial(n), parallel(n);
+        auto w1 = f.make_workspace();
+        for (int inv = 0; inv < 2; ++inv)
+        {
+            if (ip)
+            {
+                serial = a0;
+                parallel = a0;
+                f.execute_inplace(serial.data(), inv, w1);
+                f.execute_inplace(parallel.data(), inv, wss, par);
+            }
+            else
+            {
+                f.execute(serial.data(), a0.data(), inv, w1);
+                f.execute(parallel.data(), a0.data(), inv, wss, par);
+            }
+            const bool same = std::memcmp((const void*)serial.data(), (const void*)parallel.data(), n * sizeof(complex<T>)) == 0;
+            printf("  %-15s %s\n", ip ? (inv ? "mt inplace inv" : "mt inplace") : (inv ? "mt oop inv" : "mt oop"),
+                   same ? "OK (bit-identical)" : "FAIL");
+            fails += !same;
+        }
     }
     {
         fft_fourstep<T> f(n); // default options
