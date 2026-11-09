@@ -238,6 +238,12 @@ public:
         exec_inplace(x, inverse, wss.data(), &par);
     }
 
+    /// Pointer form of the API above: `wss` points to one workspace per worker, `par` may be null (serial).
+    void execute_inplace(C* x, bool inverse, workspace* wss, const parallel_for_t* par) const
+    {
+        exec_inplace(x, inverse, wss, par);
+    }
+
     // ---- convenience overloads using one internal workspace (not thread-safe)
     void execute(C* out, const C* in, bool inverse = false) { execute(out, in, inverse, own_ws()); }
     void execute_inplace(C* x, bool inverse = false) { execute_inplace(x, inverse, own_ws()); }
@@ -567,15 +573,16 @@ private:
             while (n % r == 0) n /= r;
         return n < 101;
     }
-    static double cost_per_point(size_t len)
+    // time per point of a length-`len` KFR DFT, in cache; `effort` scales the measurement time
+    static double cost_per_point(size_t len, int effort)
     {
         kfr::dft_plan<T> p(len);
         kfr::univector<C> a(len, C(T(1), T(0.5)));
         kfr::univector<kfr::u8> tmp(p.temp_size);
         p.execute(a.data(), a.data(), tmp.data());
-        const size_t reps = std::max<size_t>(4, (size_t(1) << 19) / len);
+        const size_t reps = std::max<size_t>(4, (size_t(effort) << 19) / len);
         double best       = 1e30;
-        for (int round = 0; round < 2; ++round)
+        for (int round = 0; round < 2 * effort; ++round)
         {
             const double t0 = now();
             for (size_t r = 0; r < reps; ++r) p.execute(a.data(), a.data(), tmp.data());
@@ -610,23 +617,35 @@ private:
             if ((n / d) % d == 0 || d % (n / d) == 0)
                 cdiv.push_back(d);
         const double s = std::sqrt(double(n));
-        std::map<size_t, double> cost;
-        auto c = [&](size_t len)
+        std::map<std::pair<size_t, int>, double> cost;
+        auto c = [&](size_t len, int effort)
         {
-            auto it = cost.find(len);
-            return it != cost.end() ? it->second : (cost[len] = cost_per_point(len));
+            auto it = cost.find({ len, effort });
+            return it != cost.end() ? it->second : (cost[{ len, effort }] = cost_per_point(len, effort));
         };
-        auto total = [&](size_t d)
-        { return opt.measure ? c(d) + c(n / d) : std::fabs(std::log(d / s)); };
+        auto total = [&](size_t d, int effort)
+        { return opt.measure ? c(d, effort) + c(n / d, effort) : std::fabs(std::log(d / s)); };
+        // rank by a quick measurement, then re-measure the best few with more effort: single quick
+        // timings are noisy (a few percent) and the splits at the top of the list are close to each other
+        auto shortlist = [&](std::vector<size_t> v)
+        {
+            std::sort(v.begin(), v.end(), [&](size_t a, size_t b) { return total(a, 1) < total(b, 1); });
+            if (opt.measure && v.size() > 3)
+                v.resize(3);
+            return v;
+        };
         auto best_of = [&](const std::vector<size_t>& v)
-        { return *std::min_element(v.begin(), v.end(), [&](size_t a, size_t b) { return total(a) < total(b); }); };
-        const size_t any = best_of(cand);
+        {
+            const int effort = opt.measure ? 4 : 1;
+            return *std::min_element(v.begin(), v.end(), [&](size_t a, size_t b) { return total(a, effort) < total(b, effort); });
+        };
+        const size_t any = best_of(shortlist(cand));
         if (!opt.prefer_inplace || cdiv.empty())
             return any;
-        const size_t div = best_of(cdiv);
+        const size_t div = best_of(shortlist(cdiv));
         if (!opt.measure)
             return div;
-        return total(div) <= opt.inplace_slack * total(any) ? div : any;
+        return total(div, 4) <= opt.inplace_slack * total(any, 4) ? div : any;
     }
 
     size_t N, N1 = 1, N2 = 1, B, pf, Lbits = 0;
