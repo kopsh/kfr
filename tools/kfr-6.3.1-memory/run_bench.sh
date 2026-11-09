@@ -11,7 +11,7 @@ CXX=${CXX:-clang++}
 N=200000000
 REPS=5
 TYPES="f32 f64"
-FLAGS="-O3 -DNDEBUG -ffp-contract=fast"
+FLAGS="-O3 -DNDEBUG -ffp-contract=fast -pthread"
 while [ $# -gt 0 ]; do
     case "$1" in
         --kfr) KFR=$2; shift 2 ;;

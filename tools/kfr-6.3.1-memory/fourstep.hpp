@@ -11,8 +11,14 @@
 //
 //   execute(out, in)       out-of-place, `in` is preserved.            memory: in + out
 //   execute_inplace(x)     in-place.                                   memory: x only
-//                          Needs a split where N1 divides N2 or N2 divides N1 (options.inplace = true);
-//                          otherwise it falls back to an internal N-point work buffer.
+//                          Needs a split where N1 divides N2 or N2 divides N1. The default options prefer
+//                          such a split (unless it is more than options.inplace_slack slower, measured);
+//                          without one it falls back to a temporary N-point buffer for that call.
+//
+// Thread safety: the plan itself (sub-plans, twiddle tables) is immutable. The per-call scratch memory
+// (a few MB) lives in a `workspace`. The overloads that take a workspace are const and may be called
+// concurrently with one workspace per thread; the overloads without it use one internal workspace and
+// must not be called concurrently.
 //
 // Out-of-place data flow (no transpose pass, no extra buffer):
 //   step 1 gathers B columns of `in` (strided), transforms them and writes them contiguously to out as
@@ -49,30 +55,32 @@ public:
     {
         size_t n1         = 0;    // force N1 (0 = choose automatically)
         bool measure      = true; // time candidate sub-FFT lengths on this machine
-        bool inplace      = false; // restrict to splits that allow execute_inplace() without a work buffer
+        bool prefer_inplace    = true; // prefer a split that lets execute_inplace() run without a work buffer
+        double inplace_slack   = 1.05; // ... unless its measured cost is more than this factor above the best split
+        int oop_strategy       = -1;   // execute(): -1 auto, 0 always direct, 1 always copy + in-place
         size_t min_len    = 512;
         size_t max_bytes  = size_t(1) << 20; // max sub-FFT size in bytes (keep it near L2)
         size_t block      = 16;   // columns/rows per block
         size_t prefetch   = 8;    // prefetch distance in rows (0 = off)
     };
 
+    /// Options for callers that only use execute_inplace(): always pick a split that needs no work buffer.
+    static options for_inplace()
+    {
+        options o;
+        o.inplace_slack = 1e9;
+        return o;
+    }
+
     explicit fft_fourstep(size_t n) : fft_fourstep(n, options{}) {}
-    fft_fourstep(size_t n, const options& opt) : N(n), B(opt.block), pf(opt.prefetch)
+    fft_fourstep(size_t n, const options& opt) : N(n), B(opt.block), pf(opt.prefetch), oop_strategy(opt.oop_strategy)
     {
         N1 = opt.n1 ? opt.n1 : choose_n1(n, opt);
-        if (N1 == 0 && opt.inplace) // no split with N1 | N2 or N2 | N1: use a work buffer instead
-        {
-            options o2 = opt;
-            o2.inplace = false;
-            N1         = choose_n1(n, o2);
-        }
         if (N1 == 0 || n % N1 != 0)
             throw std::invalid_argument("fft_fourstep: no usable N1 * N2 split");
         N2 = n / N1;
         p1 = kfr::dft_plan<T>(N1);
         p2 = kfr::dft_plan<T>(N2);
-        temp.resize(std::max(p1.temp_size, p2.temp_size));
-        buf.resize(B * std::max(N1, N2));
         while ((size_t(1) << (2 * Lbits)) < N) ++Lbits;
         const size_t L = size_t(1) << Lbits;
         lo.resize(2 * L);
@@ -88,55 +96,99 @@ public:
     static size_t find_split(size_t n, bool inplace = false)
     {
         options o;
-        o.measure = false;
-        o.inplace = inplace;
+        o.measure        = false;
+        o.prefer_inplace = inplace;
         return choose_n1(n, o);
+    }
+
+    /// Per-call scratch memory (a few MB). One per thread for concurrent calls.
+    struct workspace
+    {
+        kfr::univector<kfr::u8> temp;
+        kfr::univector<C> buf;
+        size_t bytes() const { return temp.size() + buf.size() * sizeof(C); }
+    };
+    workspace make_workspace() const
+    {
+        workspace w;
+        w.temp.resize(std::max(p1.temp_size, p2.temp_size));
+        w.buf.resize(B * std::max(N1, N2));
+        return w;
     }
 
     size_t size() const { return N; }
     size_t n1() const { return N1; }
     size_t n2() const { return N2; }
-    /// True if execute_inplace() needs no N-point work buffer for this plan.
+    /// True if execute_inplace() needs no N-point buffer for this plan.
     bool inplace_without_work() const { return N2 % N1 == 0 || N1 % N2 == 0; }
-    /// Memory owned by this object, excluding the internal N-point work buffer (see work_bytes()).
+    /// Memory owned by the plan (twiddles, sub-plans) plus one workspace.
     size_t extra_bytes() const
     {
-        return p1.data_size + p2.data_size + temp.size() + buf.size() * sizeof(C) +
-               (lo.size() + hi.size() + wj.size()) * sizeof(T);
+        return p1.data_size + p2.data_size + (lo.size() + hi.size() + wj.size()) * sizeof(T) +
+               std::max(p1.temp_size, p2.temp_size) + B * std::max(N1, N2) * sizeof(C);
     }
-    size_t work_bytes() const { return work ? N * sizeof(C) : 0; }
-    void release_work() { work.reset(); }
 
-    /// Out-of-place, `in` is preserved. `out` must not overlap `in`. No extra memory beyond extra_bytes().
-    void execute(C* out, const C* in, bool inverse = false)
+    /// True if execute() runs as copy + in-place transform. Measured: with a power-of-two N1 the strided
+    /// column accesses of the direct out-of-place algorithm alias in the cache and copy + in-place is faster.
+    bool oop_via_inplace() const
+    {
+        if (!inplace_without_work())
+            return false;
+        if (oop_strategy >= 0)
+            return oop_strategy == 1;
+        return (N1 & (N1 - 1)) == 0;
+    }
+
+    /// Out-of-place, `in` is preserved. `out` must not overlap `in`. Thread-safe with one workspace per thread.
+    void execute(C* out, const C* in, bool inverse, workspace& ws) const
+    {
+        if (oop_via_inplace())
+        {
+            execute_copy_inplace(out, in, inverse, ws);
+            return;
+        }
+        run_oop_direct(out, in, inverse, ws);
+    }
+
+    void run_oop_direct(C* out, const C* in, bool inverse, workspace& ws) const
     {
         if (inverse)
-            run_oop<true>(out, in);
+            run_oop<true>(out, in, ws);
         else
-            run_oop<false>(out, in);
+            run_oop<false>(out, in, ws);
     }
 
-    /// In-place. No extra N-point memory if inplace_without_work().
-    void execute_inplace(C* x, bool inverse = false)
+    /// In-place. No extra N-point memory if inplace_without_work(); otherwise a temporary N-point buffer.
+    void execute_inplace(C* x, bool inverse, workspace& ws) const
     {
         if (inplace_without_work())
         {
             if (inverse)
-                run_inplace<true>(x);
+                run_inplace<true>(x, ws);
             else
-                run_inplace<false>(x);
+                run_inplace<false>(x, ws);
         }
         else
         {
-            if (!work)
-                work.reset(new C[N]);
-            execute(work.get(), x, inverse);
-            std::memcpy(static_cast<void*>(x), work.get(), N * sizeof(C));
+            std::unique_ptr<C[]> tmp(new C[N]);
+            run_oop_direct(tmp.get(), x, inverse, ws);
+            std::memcpy(static_cast<void*>(x), tmp.get(), N * sizeof(C));
         }
     }
 
+    /// Out-of-place with the input preserved, as copy + in-place transform (same memory as execute()).
+    void execute_copy_inplace(C* out, const C* in, bool inverse, workspace& ws) const
+    {
+        std::memcpy(static_cast<void*>(out), in, N * sizeof(C));
+        execute_inplace(out, inverse, ws);
+    }
+
+    // Convenience overloads using one internal workspace (not thread-safe).
+    void execute(C* out, const C* in, bool inverse = false) { execute(out, in, inverse, own_ws()); }
+    void execute_inplace(C* x, bool inverse = false) { execute_inplace(x, inverse, own_ws()); }
+
 #if FS_PROFILE
-    double prof[9] = {}; // 0 gather1, 8 fft1, 1 twiddle+store, 2 gather2, 3 fft2, 4 scatter2, 6 chunk, 7 square
+    mutable double prof[9] = {}; // 0 gather1, 8 fft1, 1 twiddle+store, 2 gather2, 3 fft2, 4 scatter2, 6 chunk, 7 square
 #endif
 
 private:
@@ -166,10 +218,10 @@ private:
     // Step 1 on B columns: gather x[n1][c0..c0+nb) (row stride N2 complex), length-N1 DFTs, twiddle.
     // Result is left in buf as b[j*N1 + k1] (already multiplied by w_N^((c0+j)*k1)).
     template <bool inv>
-    void step1_block(const T* x, size_t c0, size_t nb)
+    void step1_block(const T* x, size_t c0, size_t nb, workspace& ws) const
     {
-        T* b              = reinterpret_cast<T*>(buf.data());
-        kfr::u8* t        = temp.data();
+        T* b              = reinterpret_cast<T*>(ws.buf.data());
+        kfr::u8* t        = ws.temp.data();
         FS_T0;
         for (size_t n1 = 0; n1 < N1; ++n1)
         {
@@ -186,26 +238,26 @@ private:
         FS_TICK(0);
         for (size_t j = 0; j < nb; ++j)
         {
-            C* col = buf.data() + j * N1;
+            C* col = ws.buf.data() + j * N1;
             p1.execute(col, col, t, kfr::cbool<inv>);
         }
         FS_TICK(8);
     }
 
     template <bool inv>
-    void run_oop(C* dst, const C* src)
+    void run_oop(C* dst, const C* src, workspace& ws) const
     {
         const T* x        = reinterpret_cast<const T*>(src);
         T* o              = reinterpret_cast<T*>(dst);
-        T* b              = reinterpret_cast<T*>(buf.data());
-        kfr::u8* t        = temp.data();
+        T* b              = reinterpret_cast<T*>(ws.buf.data());
+        kfr::u8* t        = ws.temp.data();
         const size_t mask = (size_t(1) << Lbits) - 1;
         FS_T0;
         // step 1: columns of `in`, results stored contiguously as o[n2*N1 + k1]
         for (size_t c0 = 0; c0 < N2; c0 += B)
         {
             const size_t nb = std::min(B, N2 - c0);
-            step1_block<inv>(x, c0, nb);
+            step1_block<inv>(x, c0, nb, ws);
             FS_RESET;
             size_t m = 0; // c0 * k1
             for (size_t k1 = 0; k1 < N1; ++k1, m += c0)
@@ -248,7 +300,7 @@ private:
             FS_TICK(2);
             for (size_t j = 0; j < nb; ++j)
             {
-                C* col = buf.data() + j * N2;
+                C* col = ws.buf.data() + j * N2;
                 p2.execute(col, col, t, kfr::cbool<inv>);
             }
             FS_TICK(3);
@@ -269,18 +321,18 @@ private:
     }
 
     template <bool inv>
-    void run_inplace(C* xc)
+    void run_inplace(C* xc, workspace& ws) const
     {
         T* x              = reinterpret_cast<T*>(xc);
-        T* b              = reinterpret_cast<T*>(buf.data());
-        kfr::u8* t        = temp.data();
+        T* b              = reinterpret_cast<T*>(ws.buf.data());
+        kfr::u8* t        = ws.temp.data();
         const size_t mask = (size_t(1) << Lbits) - 1;
         FS_T0;
         // step 1 on the [n1][n2] layout, written back to the locations it was read from
         for (size_t c0 = 0; c0 < N2; c0 += B)
         {
             const size_t nb = std::min(B, N2 - c0);
-            step1_block<inv>(x, c0, nb);
+            step1_block<inv>(x, c0, nb, ws);
             FS_RESET;
             size_t m = 0;
             for (size_t k1 = 0; k1 < N1; ++k1, m += c0)
@@ -320,7 +372,7 @@ private:
     }
 
     // ---- in-place transpose of a rows x cols row-major matrix, where cols % rows == 0 or rows % cols == 0
-    void transpose_inplace(C* a, size_t rows, size_t cols)
+    void transpose_inplace(C* a, size_t rows, size_t cols) const
     {
         if (rows == 1 || cols == 1)
             return; // a vector: memory layout is already the transpose
@@ -344,7 +396,7 @@ private:
     }
 
     // a is a (g_rows x g_cols) row-major grid of chunks of `len` complex numbers; transpose the grid
-    void chunk_transpose(C* a, size_t g_rows, size_t g_cols, size_t len)
+    void chunk_transpose(C* a, size_t g_rows, size_t g_cols, size_t len) const
     {
         FS_T0;
         const size_t total = g_rows * g_cols;
@@ -418,6 +470,13 @@ private:
                 std::swap(a[i * n + j], a[j * n + i]);
     }
 
+    workspace& own_ws()
+    {
+        if (own.buf.size() == 0)
+            own = make_workspace();
+        return own;
+    }
+
     void cexp_m(size_t m, T* d) const
     {
         const long double a = -2.0L * 3.141592653589793238462643383279502884L * (long double)m / (long double)N;
@@ -457,37 +516,38 @@ private:
                 if (n % d != 0)
                     continue;
                 const size_t e = n / d;
-                if (e < opt.min_len || e > maxlen || !kfr_fast(d) || !kfr_fast(e))
-                    continue;
-                if (opt.inplace && e % d != 0 && d % e != 0)
-                    continue;
-                cand.push_back(d);
+                if (e >= opt.min_len && e <= maxlen && kfr_fast(d) && kfr_fast(e))
+                    cand.push_back(d);
             }
         if (cand.empty())
             return 0;
-        if (!opt.measure)
-        {
-            const double s = std::sqrt(double(n));
-            return *std::min_element(cand.begin(), cand.end(), [&](size_t a, size_t b)
-                                     { return std::fabs(std::log(a / s)) < std::fabs(std::log(b / s)); });
-        }
+        std::vector<size_t> cdiv; // splits that allow in-place execution without a work buffer
+        for (size_t d : cand)
+            if ((n / d) % d == 0 || d % (n / d) == 0)
+                cdiv.push_back(d);
+        const double s = std::sqrt(double(n));
         std::map<size_t, double> cost;
         auto c = [&](size_t len)
         {
             auto it = cost.find(len);
             return it != cost.end() ? it->second : (cost[len] = cost_per_point(len));
         };
-        size_t best = cand[0];
-        for (size_t d : cand)
-            if (c(d) + c(n / d) < c(best) + c(n / best))
-                best = d;
-        return best;
+        auto total = [&](size_t d)
+        { return opt.measure ? c(d) + c(n / d) : std::fabs(std::log(d / s)); };
+        auto best_of = [&](const std::vector<size_t>& v)
+        { return *std::min_element(v.begin(), v.end(), [&](size_t a, size_t b) { return total(a) < total(b); }); };
+        const size_t any = best_of(cand);
+        if (!opt.prefer_inplace || cdiv.empty())
+            return any;
+        const size_t div = best_of(cdiv);
+        if (!opt.measure)
+            return div;
+        return total(div) <= opt.inplace_slack * total(any) ? div : any;
     }
 
     size_t N, N1 = 1, N2 = 1, B, pf, Lbits = 0;
+    int oop_strategy = -1;
     kfr::dft_plan<T> p1, p2;
-    kfr::univector<kfr::u8> temp;
-    kfr::univector<C> buf;
     std::vector<T> lo, hi, wj;
-    std::unique_ptr<C[]> work;
+    workspace own;
 };
