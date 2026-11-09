@@ -43,6 +43,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <cstdio>
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
 
 template <typename T>
 class fft_fourstep
@@ -58,7 +62,7 @@ public:
         double inplace_slack   = 1.05; // ... unless its measured cost is more than this factor above the best split
         int oop_strategy       = -1;   // execute(): -1 auto, 0 always direct, 1 always copy + in-place
         size_t min_len    = 512;
-        size_t max_bytes  = size_t(1) << 20; // max sub-FFT size in bytes (keep it near L2)
+        size_t max_bytes  = 0;    // max sub-FFT size in bytes (0 = auto: half of the L2 cache, between 128 KiB and 1 MiB)
         size_t block      = 16;   // columns/rows per block
         size_t prefetch   = 8;    // prefetch distance in rows (0 = off)
     };
@@ -89,6 +93,42 @@ public:
         wj.resize(2 * N1 * B); // wj[k1][j] = w_N^(j*k1)
         for (size_t k1 = 0; k1 < N1; ++k1)
             for (size_t j = 0; j < B; ++j) cexp_m(j * k1 % N, wj.data() + 2 * (k1 * B + j));
+    }
+
+    /// Size of one core's L2 cache in bytes, or 0 if it cannot be determined.
+    static size_t l2_cache_bytes()
+    {
+#if defined(_SC_LEVEL2_CACHE_SIZE)
+        if (long v = sysconf(_SC_LEVEL2_CACHE_SIZE); v > 0)
+            return size_t(v);
+#endif
+        for (int idx = 0; idx < 8; ++idx) // Linux sysfs: cpu0/cache/index<i>/{level,size}
+        {
+            char path[96], buf[32] = {};
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/level", idx);
+            FILE* f = fopen(path, "r");
+            if (!f)
+                break;
+            const bool l2 = fgets(buf, sizeof(buf), f) && atoi(buf) == 2;
+            fclose(f);
+            if (!l2)
+                continue;
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
+            if (!(f = fopen(path, "r")))
+                break;
+            size_t bytes = 0;
+            if (fgets(buf, sizeof(buf), f))
+            {
+                bytes = size_t(atol(buf));
+                if (strchr(buf, 'K'))
+                    bytes <<= 10;
+                else if (strchr(buf, 'M'))
+                    bytes <<= 20;
+            }
+            fclose(f);
+            return bytes;
+        }
+        return 0;
     }
 
     /// Returns a usable split for n, or 0 when there is none (fall back to dft_plan<T>(n) then).
@@ -545,7 +585,14 @@ private:
     }
     static size_t choose_n1(size_t n, const options& opt)
     {
-        size_t maxlen = std::max<size_t>(opt.max_bytes / sizeof(C), opt.min_len);
+        size_t max_bytes = opt.max_bytes;
+        if (max_bytes == 0)
+        {
+            const size_t l2 = l2_cache_bytes();
+            max_bytes       = l2 ? std::min<size_t>(std::max<size_t>(l2 / 2, size_t(128) << 10), size_t(1) << 20)
+                                 : size_t(1) << 20;
+        }
+        size_t maxlen = std::max<size_t>(max_bytes / sizeof(C), opt.min_len);
         std::vector<size_t> cand;
         for (int attempt = 0; attempt < 8 && cand.empty(); ++attempt, maxlen *= 4)
             for (size_t d = opt.min_len; d <= maxlen && d * opt.min_len <= n; ++d)

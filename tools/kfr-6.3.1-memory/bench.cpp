@@ -84,6 +84,7 @@ static int timing(size_t n, const std::string& mode, int reps)
         auto opt           = fs_opts<T>();
         opt.prefer_inplace = mode != "fs" && mode != "fs_inplace_work";
         opt.inplace_slack  = mode == "fs_inplace" ? 1e9 : opt.inplace_slack;
+        opt.oop_strategy   = mode == "fs" ? 0 : -1;
         fft_fourstep<T> f(n, opt);
         tplan = now() - t0;
         char s[96];
@@ -93,7 +94,7 @@ static int timing(size_t n, const std::string& mode, int reps)
         {
             restore();
             double a = now();
-            if (mode == "fs")
+            if (mode == "fs" || mode == "fs_auto")
                 f.execute(out.data(), in.data());
             else
                 f.execute_inplace(in.data());
@@ -355,6 +356,8 @@ int main(int argc, char** argv)
         override_cpu(s == "sse2" ? cpu_t::sse2 : s == "sse41" ? cpu_t::sse41 : s == "avx" ? cpu_t::avx1 : cpu_t::avx2);
     }
 #endif
+    if (getenv("FS_INFO"))
+        printf("l2_cache_bytes=%zu\n", fft_fourstep<float>::l2_cache_bytes());
     const size_t n = strtoull(argv[1], nullptr, 10);
     const bool f64 = !strcmp(argv[2], "f64");
     std::string mode = argv[3];
