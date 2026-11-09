@@ -155,6 +155,71 @@ public:
         return w;
     }
 
+    struct tune_result
+    {
+        options best;                                   ///< `base` with n1 set to the fastest split found
+        std::vector<std::pair<size_t, double>> tried;   ///< (N1, best seconds) for every candidate that was run
+    };
+
+    /// Opt-in tuning on the real size: runs the `max_candidates` most promising splits (ranked by the sub-FFT
+    /// timing model) a few times and returns the options of the fastest one. Use it once per size on the
+    /// target machine and keep the resulting options.n1. Needs memory for the data it transforms:
+    /// n complex numbers for `inplace` mode, 2n for out-of-place.
+    static tune_result autotune(size_t n, const options& base = options{}, bool inplace = true, int reps = 2,
+                                size_t max_candidates = 6)
+    {
+        options o = base;
+        std::vector<size_t> cand = all_splits(n, o);
+        if (inplace)
+        {
+            std::vector<size_t> d;
+            for (size_t x : cand)
+                if (divisible_split(n, x))
+                    d.push_back(x);
+            if (!d.empty())
+                cand = d;
+        }
+        std::map<size_t, double> quick;
+        for (size_t d : cand) quick[d] = cost_per_point(d, 1) + cost_per_point(n / d, 1);
+        std::sort(cand.begin(), cand.end(), [&](size_t a, size_t b) { return quick[a] < quick[b]; });
+        if (cand.size() > max_candidates)
+            cand.resize(max_candidates);
+        tune_result res;
+        res.best = base;
+        kfr::univector<C> a(n), out(inplace ? 0 : n);
+        double best = 1e30;
+        for (size_t d : cand)
+        {
+            options t        = base;
+            t.n1             = d;
+            t.prefer_inplace = inplace;
+            if (inplace)
+                t.inplace_slack = 1e9;
+            t.oop_strategy = inplace ? t.oop_strategy : 0;
+            fft_fourstep f(n, t);
+            auto ws       = f.make_workspace();
+            double fastest = 1e30;
+            for (int r = 0; r < std::max(1, reps); ++r)
+            {
+                for (size_t i = 0; i < n; ++i) // cheap refill: the unnormalized transform would overflow otherwise
+                    a[i] = C(T(i & 1023) * T(1e-3), T((i >> 10) & 1023) * T(1e-3));
+                const double t0 = now();
+                if (inplace)
+                    f.execute_inplace(a.data(), false, ws);
+                else
+                    f.execute(out.data(), a.data(), false, ws);
+                fastest = std::min(fastest, now() - t0);
+            }
+            res.tried.emplace_back(d, fastest);
+            if (fastest < best)
+            {
+                best        = fastest;
+                res.best.n1 = d;
+            }
+        }
+        return res;
+    }
+
     size_t size() const { return N; }
     size_t n1() const { return N1; }
     size_t n2() const { return N2; }
@@ -590,16 +655,17 @@ private:
         }
         return best;
     }
-    static size_t choose_n1(size_t n, const options& opt)
+    static size_t default_max_bytes(const options& opt)
     {
-        size_t max_bytes = opt.max_bytes;
-        if (max_bytes == 0)
-        {
-            const size_t l2 = l2_cache_bytes();
-            max_bytes       = l2 ? std::min<size_t>(std::max<size_t>(l2 / 2, size_t(128) << 10), size_t(1) << 20)
-                                 : size_t(1) << 20;
-        }
-        size_t maxlen = std::max<size_t>(max_bytes / sizeof(C), opt.min_len);
+        if (opt.max_bytes)
+            return opt.max_bytes;
+        const size_t l2 = l2_cache_bytes();
+        return l2 ? std::min<size_t>(std::max<size_t>(l2 / 2, size_t(128) << 10), size_t(1) << 20) : size_t(1) << 20;
+    }
+    // all N1 with a usable N1 * N2 split (both factors fast in KFR, within the length limits)
+    static std::vector<size_t> all_splits(size_t n, const options& opt)
+    {
+        size_t maxlen = std::max<size_t>(default_max_bytes(opt) / sizeof(C), opt.min_len);
         std::vector<size_t> cand;
         for (int attempt = 0; attempt < 8 && cand.empty(); ++attempt, maxlen *= 4)
             for (size_t d = opt.min_len; d <= maxlen && d * opt.min_len <= n; ++d)
@@ -610,11 +676,18 @@ private:
                 if (e >= opt.min_len && e <= maxlen && kfr_fast(d) && kfr_fast(e))
                     cand.push_back(d);
             }
+        return cand;
+    }
+    static bool divisible_split(size_t n, size_t d) { return (n / d) % d == 0 || d % (n / d) == 0; }
+
+    static size_t choose_n1(size_t n, const options& opt)
+    {
+        std::vector<size_t> cand = all_splits(n, opt);
         if (cand.empty())
             return 0;
         std::vector<size_t> cdiv; // splits that allow in-place execution without a work buffer
         for (size_t d : cand)
-            if ((n / d) % d == 0 || d % (n / d) == 0)
+            if (divisible_split(n, d))
                 cdiv.push_back(d);
         const double s = std::sqrt(double(n));
         std::map<std::pair<size_t, int>, double> cost;

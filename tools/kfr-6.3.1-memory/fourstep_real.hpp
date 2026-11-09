@@ -40,6 +40,12 @@ public:
     }
 
     static size_t find_split(size_t n) { return n % 2 ? 0 : core_t::find_split(n / 2, true); }
+    /// See fft_fourstep::autotune; tunes the complex transform of size n / 2 that this class runs.
+    static typename core_t::tune_result autotune(size_t n, const options& base = options{}, bool inplace = true,
+                                                  int reps = 2, size_t max_candidates = 6)
+    {
+        return core_t::autotune(n / 2, base, inplace, reps, max_candidates);
+    }
 
     size_t size() const { return N; }
     size_t complex_bins() const { return M + 1; }

@@ -78,6 +78,12 @@ for t in $TYPES; do
     "$B" "$N" $t ab direct fs_auto 8 | tail -4
 done
 
+echo "== autotune: time the most promising N1 x N2 splits on the real size (keep the best as options.n1)"
+for t in $TYPES; do
+    "$B" "$N" $t tune inplace
+    "$B" "$N" $t tune oop
+done
+
 echo "== block size sweep (FS_B), single thread, fs_inplace"
 for t in $TYPES; do
     for b in 8 16 32 64; do

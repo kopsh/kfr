@@ -2,6 +2,7 @@
 //
 //   bench N f32|f64 MODE [reps]          time and peak RSS (input regenerated before every run, not timed)
 //   bench N f32|f64 rdirect|rfs|rfs_inplace [reps]   real input, N real samples (KFR dft_plan_real vs four-step)
+//   bench N f32|f64 tune [inplace|oop] [real]   autotune: time the best few splits on this size, print the fastest
 //   bench N f32|f64 check                accuracy of all modes vs f64 dft_plan, plus inverse, plus a 2-thread test
 //   bench N f32|f64 ab A B [reps]        interleaved A/B timing in one process (A,B in turn, order alternates);
 //                                        prints both medians and the median/min/max of the per-pair ratio B/A
@@ -544,6 +545,25 @@ int main(int argc, char** argv)
     const size_t n = strtoull(argv[1], nullptr, 10);
     const bool f64 = !strcmp(argv[2], "f64");
     std::string mode = argv[3];
+    if (mode == "tune") // bench N f32|f64 tune [inplace|oop] [real]
+    {
+        const bool ip = argc < 5 || strcmp(argv[4], "oop") != 0;
+        const bool re = argc > 5 && strcmp(argv[5], "real") == 0;
+        auto run = [&](auto tag)
+        {
+            using T = decltype(tag);
+            auto res = re ? fft_fourstep_real<T>::autotune(n, fs_opts<T>(), ip) : fft_fourstep<T>::autotune(n, fs_opts<T>(), ip);
+            printf("tune %s %s%s n=%zu:", sizeof(T) == 4 ? "f32" : "f64", re ? "real " : "", ip ? "in-place" : "out-of-place", n);
+            for (auto& t : res.tried)
+                printf("  N1=%zu: %.3fs", t.first, t.second);
+            printf("\n  best N1=%zu  (use options.n1 = %zu)\n", res.best.n1, res.best.n1);
+        };
+        if (f64)
+            run(double());
+        else
+            run(float());
+        return 0;
+    }
     if (mode == "check")
         return (f64 ? check<double>(n) : check<float>(n)) + (n % 2 == 0 && fft_fourstep_real<float>::find_split(n) ? (f64 ? check_real<double>(n) : check_real<float>(n)) : 0);
     if (mode == "rdirect" || mode == "rfs" || mode == "rfs_inplace")
