@@ -79,10 +79,31 @@ static double data_bytes(const std::string& m, size_t n, size_t esz) { return do
 static double plan_extra_bytes(const std::string& m, size_t n, size_t esz)
 {
     const double d = data_bytes(m, n, esz);
+    // KFR runs Bluestein over the whole length when it has a prime factor >= 101: chirp (n complex) plus a
+    // power-of-two convolution (>= 2n-1) with its spectrum and scratch, conservatively 2 buffers of that size
+    auto bluestein = [&](size_t len)
+    {
+        size_t r = 1;
+        for (size_t x = len; x > 1;)
+        {
+            size_t p = 0;
+            for (size_t q : { 2, 3, 5, 7 }) if (x % q == 0) { p = q; break; }
+            if (!p) return true;
+            x /= p;
+        }
+        (void)r;
+        return false;
+    };
+    auto blue_extra = [&](size_t len)
+    {
+        size_t M = 1;
+        while (M < 2 * len - 1) M <<= 1;
+        return (double(len) + 2.0 * double(M)) * 2 * esz;
+    };
     if (m == "direct" || m == "direct_inplace")
-        return 2 * d;
+        return bluestein(n) ? blue_extra(n) : 2 * d;
     if (m == "rdirect")
-        return 2.5 * d;
+        return bluestein(n / 2) ? blue_extra(n / 2) : 2.5 * d;
     return 0.02 * d + (64 << 20); // four-step: tables + workspaces
 }
 

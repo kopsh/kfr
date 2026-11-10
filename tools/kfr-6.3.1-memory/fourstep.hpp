@@ -56,103 +56,6 @@ inline bool fs_kfr_fast(size_t n)
     return n < 101;
 }
 
-// Length-L DFT with the interface of kfr::dft_plan. Lengths KFR handles directly use dft_plan. Lengths with a
-// prime factor >= 101 (KFR would run Bluestein with a power-of-two convolution of length >= 2L-1) use Bluestein
-// here with the convolution length rounded up to the nearest 2-3-5-7-smooth number instead, which is up to
-// 1.4x shorter than the next power of two. In-place use (out == in) is supported.
-template <typename T>
-class fs_sub_dft
-{
-public:
-    using C = kfr::complex<T>;
-    size_t temp_size = 0, data_size = 0;
-
-    fs_sub_dft() = default;
-    explicit fs_sub_dft(size_t len, size_t conv_len = 0) : L(len)
-    {
-        if (fs_kfr_fast(len) || len < 2)
-        {
-            plan      = kfr::dft_plan<T>(len);
-            temp_size = plan.temp_size;
-            data_size = plan.data_size;
-            return;
-        }
-        blue = true;
-        M    = conv_len ? conv_len : smooth_at_least(2 * len - 1);
-        plan = kfr::dft_plan<T>(M);
-        chirp.resize(2 * len);
-        for (size_t n = 0; n < len; ++n) // w_n = exp(-i*pi*n^2/L), n^2 reduced mod 2L exactly
-        {
-            const unsigned long long r = (unsigned long long)n * n % (2ULL * len);
-            const long double a        = -3.141592653589793238462643383279502884L * (long double)r / (long double)len;
-            chirp[2 * n]     = T(std::cos(a));
-            chirp[2 * n + 1] = T(std::sin(a));
-        }
-        // spectrum of conj(w) wrapped to length M, scaled by 1/M (the inverse FFT below is unnormalized)
-        kfr::univector<C> b(M, C(T(0), T(0)));
-        for (size_t n = 0; n < len; ++n)
-        {
-            const C v(chirp[2 * n], -chirp[2 * n + 1]);
-            b[n] = v;
-            if (n) b[M - n] = v;
-        }
-        kfr::univector<kfr::u8> tmp(plan.temp_size);
-        plan.execute(b.data(), b.data(), tmp.data());
-        bhat.resize(M);
-        for (size_t i = 0; i < M; ++i) bhat[i] = b[i] * T(1.0L / (long double)M);
-        temp_size = M * sizeof(C) + plan.temp_size;
-        data_size = plan.data_size + (chirp.size() + bhat.size() * 2) * sizeof(T);
-    }
-    size_t conv_len() const { return blue ? M : L; }
-    bool bluestein() const { return blue; }
-
-    template <bool inv>
-    void execute(C* out, const C* in, kfr::u8* temp, kfr::cbool_t<inv> c) const
-    {
-        if (!blue)
-        {
-            plan.execute(out, in, temp, c);
-            return;
-        }
-        C* buf        = reinterpret_cast<C*>(temp);
-        kfr::u8* ptmp = temp + M * sizeof(C);
-        const C* w    = reinterpret_cast<const C*>(chirp.data());
-        // inverse DFT(x) = conj(DFT(conj x))
-        for (size_t n = 0; n < L; ++n)
-        {
-            const C v = inv ? C(in[n].real(), -in[n].imag()) : in[n];
-            buf[n]    = v * w[n];
-        }
-        std::fill(buf + L, buf + M, C(T(0), T(0)));
-        plan.execute(buf, buf, ptmp);
-        for (size_t i = 0; i < M; ++i) buf[i] = buf[i] * bhat[i];
-        plan.execute(buf, buf, ptmp, kfr::ctrue);
-        for (size_t k = 0; k < L; ++k)
-        {
-            const C v = buf[k] * w[k];
-            out[k]    = inv ? C(v.real(), -v.imag()) : v;
-        }
-    }
-
-    static size_t smooth_at_least(size_t n)
-    {
-        size_t best = size_t(1) << 62;
-        for (size_t p2 = 1; p2 < best; p2 *= 2)
-            for (size_t p3 = p2; p3 < best; p3 *= 3)
-                for (size_t p5 = p3; p5 < best; p5 *= 5)
-                    for (size_t p7 = p5; p7 < best; p7 *= 7)
-                        if (p7 >= n) { best = std::min(best, p7); break; }
-        return best;
-    }
-
-private:
-    size_t L = 0, M = 0;
-    bool blue = false;
-    kfr::dft_plan<T> plan;
-    std::vector<T> chirp;
-    kfr::univector<C> bhat;
-};
-
 template <typename T>
 class fft_fourstep
 {
@@ -187,8 +90,8 @@ public:
         if (N1 == 0 || n % N1 != 0)
             throw std::invalid_argument("fft_fourstep: no usable N1 * N2 split");
         N2 = n / N1;
-        p1 = fs_sub_dft<T>(N1);
-        p2 = fs_sub_dft<T>(N2);
+        p1 = kfr::dft_plan<T>(N1);
+        p2 = kfr::dft_plan<T>(N2);
         while ((size_t(1) << (2 * Lbits)) < N) ++Lbits;
         const size_t L = size_t(1) << Lbits;
         lo.resize(2 * L);
@@ -750,16 +653,16 @@ private:
     // time per point of a length-`len` KFR DFT, in cache; `effort` scales the measurement time
     static double cost_per_point(size_t len, int effort)
     {
-        fs_sub_dft<T> p(len);
+        kfr::dft_plan<T> p(len);
         kfr::univector<C> a(len, C(T(1), T(0.5)));
         kfr::univector<kfr::u8> tmp(p.temp_size);
-        p.execute(a.data(), a.data(), tmp.data(), kfr::cfalse);
+        p.execute(a.data(), a.data(), tmp.data());
         const size_t reps = std::max<size_t>(4, (size_t(effort) << 19) / len);
         double best       = 1e30;
         for (int round = 0; round < 2 * effort; ++round)
         {
             const double t0 = now();
-            for (size_t r = 0; r < reps; ++r) p.execute(a.data(), a.data(), tmp.data(), kfr::cfalse);
+            for (size_t r = 0; r < reps; ++r) p.execute(a.data(), a.data(), tmp.data());
             best = std::min(best, (now() - t0) / double(reps * len));
         }
         return best;
@@ -786,7 +689,7 @@ private:
                     cand.push_back(d);
             }
         // No split with two fast factors (n has a prime factor >= 101): allow one factor that needs Bluestein
-        // (fs_sub_dft runs it with a smooth convolution length), keeping the other one fast.
+        // (KFR's own dft_plan handles it; measured as fast as a hand-written Bluestein with a smooth length).
         maxlen = std::max<size_t>(default_max_bytes(opt) / sizeof(C), opt.min_len);
         for (int attempt = 0; attempt < 3 && cand.empty(); ++attempt, maxlen *= 2)
             for (size_t d = opt.min_len; d <= maxlen && d * opt.min_len <= n; ++d)
@@ -844,7 +747,7 @@ private:
 
     size_t N, N1 = 1, N2 = 1, B, pf, Lbits = 0;
     int oop_strategy = -1;
-    fs_sub_dft<T> p1, p2;
+    kfr::dft_plan<T> p1, p2;
     std::vector<T> lo, hi, wj;
     workspace own;
 };
