@@ -290,7 +290,7 @@ static int ab(size_t n, const std::string& ma_, const std::string& mb_, int reps
     fill(src.data(), e_in);
     if (e_out)
         std::memset((void*)out.data(), 0, e_out * sizeof(complex<T>));
-    runner<T> A = make_runner<T>(n, ma), B = make_runner<T>(n, mb);
+    runner<T> A = make_runner<T>(n, ma_), B = make_runner<T>(n, mb_);
     std::vector<double> ta, tb, ratio;
     auto timed = [&](runner<T>& r)
     {
